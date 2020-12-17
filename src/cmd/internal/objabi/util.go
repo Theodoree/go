@@ -25,7 +25,6 @@ var (
 	GOARCH   = envOr("GOARCH", defaultGOARCH)
 	GOOS     = envOr("GOOS", defaultGOOS)
 	GO386    = envOr("GO386", defaultGO386)
-	GOAMD64  = goamd64()
 	GOARM    = goarm()
 	GOMIPS   = gomips()
 	GOMIPS64 = gomips64()
@@ -40,17 +39,13 @@ const (
 	MachoRelocOffset = 2048 // reserve enough space for ELF relocations
 )
 
-func goamd64() string {
-	switch v := envOr("GOAMD64", defaultGOAMD64); v {
-	case "normaljumps", "alignedjumps":
-		return v
-	}
-	log.Fatalf("Invalid GOAMD64 value. Must be normaljumps or alignedjumps.")
-	panic("unreachable")
-}
-
 func goarm() int {
-	switch v := envOr("GOARM", defaultGOARM); v {
+	def := defaultGOARM
+	if GOOS == "android" && GOARCH == "arm" {
+		// Android arm devices always support GOARM=7.
+		def = "7"
+	}
+	switch v := envOr("GOARM", def); v {
 	case "5":
 		return 5
 	case "6":
@@ -134,11 +129,15 @@ func init() {
 			addexp(f)
 		}
 	}
+
+	// regabi is only supported on amd64.
+	if GOARCH != "amd64" {
+		Regabi_enabled = 0
+	}
 }
 
-func Framepointer_enabled(goos, goarch string) bool {
-	return framepointer_enabled != 0 && (goarch == "amd64" || goarch == "arm64" && goos == "linux")
-}
+// Note: must agree with runtime.framepointer_enabled.
+var Framepointer_enabled = GOARCH == "amd64" || GOARCH == "arm64" && (GOOS == "linux" || GOOS == "darwin" || GOOS == "ios")
 
 func addexp(s string) {
 	// Could do general integer parsing here, but the runtime copy doesn't yet.
@@ -162,10 +161,10 @@ func addexp(s string) {
 }
 
 var (
-	framepointer_enabled      int = 1
 	Fieldtrack_enabled        int
 	Preemptibleloops_enabled  int
 	Staticlockranking_enabled int
+	Regabi_enabled            int
 )
 
 // Toolchain experiments.
@@ -177,9 +176,9 @@ var exper = []struct {
 	val  *int
 }{
 	{"fieldtrack", &Fieldtrack_enabled},
-	{"framepointer", &framepointer_enabled},
 	{"preemptibleloops", &Preemptibleloops_enabled},
 	{"staticlockranking", &Staticlockranking_enabled},
+	{"regabi", &Regabi_enabled},
 }
 
 var defaultExpstring = Expstring()

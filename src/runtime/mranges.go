@@ -31,7 +31,7 @@ type addrRange struct {
 // Throws if the base and limit are not in the same memory segment.
 func makeAddrRange(base, limit uintptr) addrRange {
 	r := addrRange{offAddr{base}, offAddr{limit}}
-	if (base+arenaBaseOffset >= arenaBaseOffset) != (limit+arenaBaseOffset >= arenaBaseOffset) {
+	if (base-arenaBaseOffset >= base) != (limit-arenaBaseOffset >= limit) {
 		throw("addr range base and limit are not in the same memory segment")
 	}
 	return r
@@ -69,35 +69,35 @@ func (a addrRange) subtract(b addrRange) addrRange {
 	return a
 }
 
+// removeGreaterEqual removes all addresses in a greater than or equal
+// to addr and returns the new range.
+func (a addrRange) removeGreaterEqual(addr uintptr) addrRange {
+	if (offAddr{addr}).lessEqual(a.base) {
+		return addrRange{}
+	}
+	if a.limit.lessEqual(offAddr{addr}) {
+		return a
+	}
+	return makeAddrRange(a.base.addr(), addr)
+}
+
 var (
 	// minOffAddr is the minimum address in the offset space, and
-	// it corresponds to the virtual address -arenaBaseOffset.
-	//
-	// We don't initialize this with offAddrFromRaw because allocation
-	// may happen during bootstrapping, and we rely on this value
-	// being initialized.
-	//
-	// As a result, creating this value in Go is tricky because of
-	// overflow not being allowed in constants. In order to get
-	// the value we want, we take arenaBaseOffset and do a manual
-	// two's complement negation, then mask that into what can fit
-	// into a uintptr.
-	minOffAddr = offAddr{((^arenaBaseOffset) + 1) & uintptrMask}
+	// it corresponds to the virtual address arenaBaseOffset.
+	minOffAddr = offAddr{arenaBaseOffset}
 
 	// maxOffAddr is the maximum address in the offset address
-	// space, and it corresponds to the virtual address
-	// ^uintptr(0) - arenaBaseOffset.
-	//
-	// We don't initialize this with offAddrFromRaw because allocation
-	// may happen during bootstrapping, and we rely on this value
-	// being initialized.
-	maxOffAddr = offAddr{^uintptr(0) - arenaBaseOffset}
+	// space. It corresponds to the highest virtual address representable
+	// by the page alloc chunk and heap arena maps.
+	maxOffAddr = offAddr{(((1 << heapAddrBits) - 1) + arenaBaseOffset) & uintptrMask}
 )
 
 // offAddr represents an address in a contiguous view
 // of the address space on systems where the address space is
 // segmented. On other systems, it's just a normal address.
 type offAddr struct {
+	// a is just the virtual address, but should never be used
+	// directly. Call addr() to get this value instead.
 	a uintptr
 }
 
@@ -120,13 +120,13 @@ func (l1 offAddr) diff(l2 offAddr) uintptr {
 // lessThan returns true if l1 is less than l2 in the offset
 // address space.
 func (l1 offAddr) lessThan(l2 offAddr) bool {
-	return (l1.a + arenaBaseOffset) < (l2.a + arenaBaseOffset)
+	return (l1.a - arenaBaseOffset) < (l2.a - arenaBaseOffset)
 }
 
 // lessEqual returns true if l1 is less than or equal to l2 in
 // the offset address space.
 func (l1 offAddr) lessEqual(l2 offAddr) bool {
-	return (l1.a + arenaBaseOffset) <= (l2.a + arenaBaseOffset)
+	return (l1.a - arenaBaseOffset) <= (l2.a - arenaBaseOffset)
 }
 
 // equal returns true if the two offAddr values are equal.
@@ -160,10 +160,10 @@ type addrRanges struct {
 	totalBytes uintptr
 
 	// sysStat is the stat to track allocations by this type
-	sysStat *uint64
+	sysStat *sysMemStat
 }
 
-func (a *addrRanges) init(sysStat *uint64) {
+func (a *addrRanges) init(sysStat *sysMemStat) {
 	ranges := (*notInHeapSlice)(unsafe.Pointer(&a.ranges))
 	ranges.len = 0
 	ranges.cap = 16
@@ -172,20 +172,65 @@ func (a *addrRanges) init(sysStat *uint64) {
 	a.totalBytes = 0
 }
 
-// findSucc returns the first index in a such that base is
+// findSucc returns the first index in a such that addr is
 // less than the base of the addrRange at that index.
 func (a *addrRanges) findSucc(addr uintptr) int {
-	// TODO(mknyszek): Consider a binary search for large arrays.
-	// While iterating over these ranges is potentially expensive,
-	// the expected number of ranges is small, ideally just 1,
-	// since Go heaps are usually mostly contiguous.
 	base := offAddr{addr}
-	for i := range a.ranges {
+
+	// Narrow down the search space via a binary search
+	// for large addrRanges until we have at most iterMax
+	// candidates left.
+	const iterMax = 8
+	bot, top := 0, len(a.ranges)
+	for top-bot > iterMax {
+		i := ((top - bot) / 2) + bot
+		if a.ranges[i].contains(base.addr()) {
+			// a.ranges[i] contains base, so
+			// its successor is the next index.
+			return i + 1
+		}
+		if base.lessThan(a.ranges[i].base) {
+			// In this case i might actually be
+			// the successor, but we can't be sure
+			// until we check the ones before it.
+			top = i
+		} else {
+			// In this case we know base is
+			// greater than or equal to a.ranges[i].limit-1,
+			// so i is definitely not the successor.
+			// We already checked i, so pick the next
+			// one.
+			bot = i + 1
+		}
+	}
+	// There are top-bot candidates left, so
+	// iterate over them and find the first that
+	// base is strictly less than.
+	for i := bot; i < top; i++ {
 		if base.lessThan(a.ranges[i].base) {
 			return i
 		}
 	}
-	return len(a.ranges)
+	return top
+}
+
+// findAddrGreaterEqual returns the smallest address represented by a
+// that is >= addr. Thus, if the address is represented by a,
+// then it returns addr. The second return value indicates whether
+// such an address exists for addr in a. That is, if addr is larger than
+// any address known to a, the second return value will be false.
+func (a *addrRanges) findAddrGreaterEqual(addr uintptr) (uintptr, bool) {
+	i := a.findSucc(addr)
+	if i == 0 {
+		return a.ranges[0].base.addr(), true
+	}
+	if a.ranges[i-1].contains(addr) {
+		return addr, true
+	}
+	if i < len(a.ranges) {
+		return a.ranges[i].base.addr(), true
+	}
+	return 0, false
 }
 
 // contains returns true if a covers the address addr.
@@ -199,7 +244,7 @@ func (a *addrRanges) contains(addr uintptr) bool {
 
 // add inserts a new address range to a.
 //
-// r must not overlap with any address range in a.
+// r must not overlap with any address range in a and r.size() must be > 0.
 func (a *addrRanges) add(r addrRange) {
 	// The copies in this function are potentially expensive, but this data
 	// structure is meant to represent the Go heap. At worst, copying this
@@ -210,6 +255,12 @@ func (a *addrRanges) add(r addrRange) {
 	// of 16) and Go heaps are usually mostly contiguous, so the chance that
 	// an addrRanges even grows to that size is extremely low.
 
+	// An empty range has no effect on the set of addresses represented
+	// by a, but passing a zero-sized range is almost always a bug.
+	if r.size() == 0 {
+		print("runtime: range = {", hex(r.base.addr()), ", ", hex(r.limit.addr()), "}\n")
+		throw("attempted to add zero-sized address range")
+	}
 	// Because we assume r is not currently represented in a,
 	// findSucc gives us our insertion index.
 	i := a.findSucc(r.base.addr())
@@ -293,7 +344,7 @@ func (a *addrRanges) removeGreaterEqual(addr uintptr) {
 	}
 	if r := a.ranges[pivot-1]; r.contains(addr) {
 		removed += r.size()
-		r = r.subtract(makeAddrRange(addr, maxOffAddr.addr()))
+		r = r.removeGreaterEqual(addr)
 		if r.size() == 0 {
 			pivot--
 		} else {

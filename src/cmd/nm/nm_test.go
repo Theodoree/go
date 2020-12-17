@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"internal/obscuretestdata"
 	"internal/testenv"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,7 +30,7 @@ func testMain(m *testing.M) int {
 		return 0
 	}
 
-	tmpDir, err := ioutil.TempDir("", "TestNM")
+	tmpDir, err := os.MkdirTemp("", "TestNM")
 	if err != nil {
 		fmt.Println("TempDir failed:", err)
 		return 2
@@ -88,7 +87,7 @@ func TestNonGoExecs(t *testing.T) {
 
 func testGoExec(t *testing.T, iscgo, isexternallinker bool) {
 	t.Parallel()
-	tmpdir, err := ioutil.TempDir("", "TestGoExec")
+	tmpdir, err := os.MkdirTemp("", "TestGoExec")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,6 +172,9 @@ func testGoExec(t *testing.T, iscgo, isexternallinker bool) {
 		if runtime.GOOS == "windows" {
 			return true
 		}
+		if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+			return true // On darwin/arm64 everything is PIE
+		}
 		return false
 	}
 
@@ -219,7 +221,7 @@ func TestGoExec(t *testing.T) {
 
 func testGoLib(t *testing.T, iscgo bool) {
 	t.Parallel()
-	tmpdir, err := ioutil.TempDir("", "TestGoLib")
+	tmpdir, err := os.MkdirTemp("", "TestGoLib")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +244,7 @@ func testGoLib(t *testing.T, iscgo bool) {
 		err = e
 	}
 	if err == nil {
-		err = ioutil.WriteFile(filepath.Join(libpath, "go.mod"), []byte("module mylib\n"), 0666)
+		err = os.WriteFile(filepath.Join(libpath, "go.mod"), []byte("module mylib\n"), 0666)
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -283,7 +285,7 @@ func testGoLib(t *testing.T, iscgo bool) {
 	if iscgo {
 		syms = append(syms, symType{"B", "mylib.TestCgodata", false, false})
 		syms = append(syms, symType{"T", "mylib.TestCgofunc", false, false})
-		if runtime.GOOS == "darwin" || (runtime.GOOS == "windows" && runtime.GOARCH == "386") {
+		if runtime.GOOS == "darwin" || runtime.GOOS == "ios" || (runtime.GOOS == "windows" && runtime.GOARCH == "386") {
 			syms = append(syms, symType{"D", "_cgodata", true, false})
 			syms = append(syms, symType{"T", "_cgofunc", true, false})
 		} else if runtime.GOOS == "aix" {
@@ -315,7 +317,7 @@ func testGoLib(t *testing.T, iscgo bool) {
 		}
 		for i := range syms {
 			sym := &syms[i]
-			if sym.Type == typ && matchSymName(name, sym.Name) && sym.CSym == csym {
+			if sym.Type == typ && sym.Name == name && sym.CSym == csym {
 				if sym.Found {
 					t.Fatalf("duplicate symbol %s %s", sym.Type, sym.Name)
 				}
@@ -332,14 +334,6 @@ func testGoLib(t *testing.T, iscgo bool) {
 
 func TestGoLib(t *testing.T) {
 	testGoLib(t, false)
-}
-
-// Check that a symbol has a given name, accepting both
-// new and old objects.
-// TODO(go115newobj): remove.
-func matchSymName(symname, want string) bool {
-	return symname == want ||
-		strings.HasPrefix(symname, want+"#") // new style, with index
 }
 
 const testexec = `

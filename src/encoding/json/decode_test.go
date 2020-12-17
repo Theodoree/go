@@ -2099,10 +2099,7 @@ func TestSkipArrayObjects(t *testing.T) {
 // slices, and arrays.
 // Issues 4900 and 8837, among others.
 func TestPrefilled(t *testing.T) {
-	type T struct {
-		A, B int
-	}
-	// Values here change, cannot reuse the table across runs.
+	// Values here change, cannot reuse table across runs.
 	var prefillTests = []struct {
 		in  string
 		ptr interface{}
@@ -2137,16 +2134,6 @@ func TestPrefilled(t *testing.T) {
 			in:  `[3]`,
 			ptr: &[...]int{1, 2},
 			out: &[...]int{3, 0},
-		},
-		{
-			in:  `[{"A": 3}]`,
-			ptr: &[]T{{A: -1, B: -2}, {A: -3, B: -4}},
-			out: &[]T{{A: 3}},
-		},
-		{
-			in:  `[{"A": 3}]`,
-			ptr: &[...]T{{A: -1, B: -2}, {A: -3, B: -4}},
-			out: &[...]T{{A: 3, B: -2}, {}},
 		},
 	}
 
@@ -2472,6 +2459,22 @@ func TestUnmarshalRescanLiteralMangledUnquote(t *testing.T) {
 	if t1 != t2 {
 		t.Errorf("Marshal and Unmarshal roundtrip mismatch: want %q got %q", t1, t2)
 	}
+
+	// See golang.org/issues/39555.
+	input := map[textUnmarshalerString]string{"FOO": "", `"`: ""}
+
+	encoded, err := Marshal(input)
+	if err != nil {
+		t.Fatalf("Marshal unexpected error: %v", err)
+	}
+	var got map[textUnmarshalerString]string
+	if err := Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("Unmarshal unexpected error: %v", err)
+	}
+	want := map[textUnmarshalerString]string{"foo": "", `"`: ""}
+	if !reflect.DeepEqual(want, got) {
+		t.Fatalf("Unexpected roundtrip result:\nwant: %q\ngot:  %q", want, got)
+	}
 }
 
 func TestUnmarshalMaxDepth(t *testing.T) {
@@ -2567,59 +2570,5 @@ func TestUnmarshalMaxDepth(t *testing.T) {
 				}
 			})
 		}
-	}
-}
-
-func TestUnmarshalMapPointerElem(t *testing.T) {
-	type S struct{ Unchanged, Changed int }
-	input := []byte(`{"S":{"Changed":5}}`)
-	want := S{1, 5}
-
-	// First, a map with struct pointer elements. The key-value pair exists,
-	// so reuse the existing value.
-	s := &S{1, 2}
-	ptrMap := map[string]*S{"S": s}
-	if err := Unmarshal(input, &ptrMap); err != nil {
-		t.Fatal(err)
-	}
-	if s != ptrMap["S"] {
-		t.Fatal("struct pointer element in map was completely replaced")
-	}
-	if got := *s; got != want {
-		t.Fatalf("want %#v, got %#v", want, got)
-	}
-
-	// Second, a map with struct elements. The key-value pair exists, but
-	// the value isn't addresable, so make a copy and use that.
-	s = &S{1, 2}
-	strMap := map[string]S{"S": *s}
-	if err := Unmarshal(input, &strMap); err != nil {
-		t.Fatal(err)
-	}
-	if *s == strMap["S"] {
-		t.Fatal("struct element in map wasn't copied")
-	}
-	if got := strMap["S"]; got != want {
-		t.Fatalf("want %#v, got %#v", want, got)
-	}
-
-	// Finally, check the cases where the key-value pair exists, but the
-	// value is zero.
-	want = S{0, 5}
-
-	ptrMap = map[string]*S{"S": nil}
-	if err := Unmarshal(input, &ptrMap); err != nil {
-		t.Fatal(err)
-	}
-	if got := *ptrMap["S"]; got != want {
-		t.Fatalf("want %#v, got %#v", want, got)
-	}
-
-	strMap = map[string]S{"S": {}}
-	if err := Unmarshal(input, &strMap); err != nil {
-		t.Fatal(err)
-	}
-	if got := strMap["S"]; got != want {
-		t.Fatalf("want %#v, got %#v", want, got)
 	}
 }

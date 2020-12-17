@@ -1,5 +1,5 @@
 // Inferno's libkern/vlrt-arm.c
-// https://bitbucket.org/inferno-os/inferno-os/src/default/libkern/vlrt-arm.c
+// https://bitbucket.org/inferno-os/inferno-os/src/master/libkern/vlrt-arm.c
 //
 //         Copyright © 1994-1999 Lucent Technologies Inc. All rights reserved.
 //         Revisions Copyright © 2000-2007 Vita Nuova Holdings Limited (www.vitanuova.com).  All rights reserved.
@@ -263,7 +263,7 @@ func slowdodiv(n, d uint64) (q, r uint64) {
 	return q, n
 }
 
-// Floating point control word values for GOARCH=386 GO386=387.
+// Floating point control word values.
 // Bits 0-5 are bits to disable floating-point exceptions.
 // Bits 8-9 are the precision control:
 //   0 = single precision a.k.a. float32
@@ -273,6 +273,5 @@ func slowdodiv(n, d uint64) (q, r uint64) {
 //   3 = round toward zero
 var (
 	controlWord64      uint16 = 0x3f + 2<<8 + 0<<10
-	controlWord32             = 0x3f + 0<<8 + 0<<10
-	controlWord64trunc        = 0x3f + 2<<8 + 3<<10
+	controlWord64trunc uint16 = 0x3f + 2<<8 + 3<<10
 )

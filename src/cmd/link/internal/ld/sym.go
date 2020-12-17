@@ -1,6 +1,6 @@
 // Derived from Inferno utils/6l/obj.c and utils/6l/span.c
-// https://bitbucket.org/inferno-os/inferno-os/src/default/utils/6l/obj.c
-// https://bitbucket.org/inferno-os/inferno-os/src/default/utils/6l/span.c
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/6l/obj.c
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/6l/span.c
 //
 //	Copyright © 1994-1999 Lucent Technologies Inc.  All rights reserved.
 //	Portions Copyright © 1995-1997 C H Forsyth (forsyth@terzarima.net)
@@ -44,12 +44,13 @@ func linknew(arch *sys.Arch) *Link {
 	ler := loader.ErrorReporter{AfterErrorAction: afterErrorAction}
 	ctxt := &Link{
 		Target:        Target{Arch: arch},
-		Syms:          sym.NewSymbols(),
+		version:       sym.SymVerStatic,
 		outSem:        make(chan int, 2*runtime.GOMAXPROCS(0)),
 		Out:           NewOutBuf(arch),
 		LibraryByPkg:  make(map[string]*sym.Library),
 		numelfsym:     1,
 		ErrorReporter: ErrorReporter{ErrorReporter: ler},
+		generatorSyms: make(map[loader.Sym]generatorFunc),
 	}
 
 	if objabi.GOARCH != arch.Name {

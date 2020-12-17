@@ -5,6 +5,7 @@
 package tls
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -13,6 +14,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"sync/atomic"
 	"time"
@@ -22,6 +24,7 @@ import (
 // It's discarded once the handshake has completed.
 type serverHandshakeState struct {
 	c            *Conn
+	ctx          context.Context
 	clientHello  *clientHelloMsg
 	hello        *serverHelloMsg
 	suite        *cipherSuite
@@ -36,8 +39,8 @@ type serverHandshakeState struct {
 }
 
 // serverHandshake performs a TLS handshake as a server.
-func (c *Conn) serverHandshake() error {
-	clientHello, err := c.readClientHello()
+func (c *Conn) serverHandshake(ctx context.Context) error {
+	clientHello, err := c.readClientHello(ctx)
 	if err != nil {
 		return err
 	}
@@ -45,6 +48,7 @@ func (c *Conn) serverHandshake() error {
 	if c.vers == VersionTLS13 {
 		hs := serverHandshakeStateTLS13{
 			c:           c,
+			ctx:         ctx,
 			clientHello: clientHello,
 		}
 		return hs.handshake()
@@ -52,6 +56,7 @@ func (c *Conn) serverHandshake() error {
 
 	hs := serverHandshakeState{
 		c:           c,
+		ctx:         ctx,
 		clientHello: clientHello,
 	}
 	return hs.handshake()
@@ -75,13 +80,8 @@ func (hs *serverHandshakeState) handshake() error {
 		if err := hs.establishKeys(); err != nil {
 			return err
 		}
-		// ticketSupported is set in a resumption handshake if the
-		// ticket from the client was encrypted with an old session
-		// ticket key and thus a refreshed ticket should be sent.
-		if hs.hello.ticketSupported {
-			if err := hs.sendSessionTicket(); err != nil {
-				return err
-			}
+		if err := hs.sendSessionTicket(); err != nil {
+			return err
 		}
 		if err := hs.sendFinished(c.serverFinished[:]); err != nil {
 			return err
@@ -128,7 +128,7 @@ func (hs *serverHandshakeState) handshake() error {
 }
 
 // readClientHello reads a ClientHello message and selects the protocol version.
-func (c *Conn) readClientHello() (*clientHelloMsg, error) {
+func (c *Conn) readClientHello(ctx context.Context) (*clientHelloMsg, error) {
 	msg, err := c.readHandshake()
 	if err != nil {
 		return nil, err
@@ -142,7 +142,7 @@ func (c *Conn) readClientHello() (*clientHelloMsg, error) {
 	var configForClient *Config
 	originalConfig := c.config
 	if c.config.GetConfigForClient != nil {
-		chi := clientHelloInfo(c, clientHello)
+		chi := clientHelloInfo(ctx, c, clientHello)
 		if configForClient, err = c.config.GetConfigForClient(chi); err != nil {
 			c.sendAlert(alertInternalError)
 			return nil, err
@@ -218,13 +218,13 @@ func (hs *serverHandshakeState) processClientHello() error {
 	}
 
 	if len(hs.clientHello.alpnProtocols) > 0 {
-		if selectedProto, fallback := mutualProtocol(hs.clientHello.alpnProtocols, c.config.NextProtos); !fallback {
+		if selectedProto := mutualProtocol(hs.clientHello.alpnProtocols, c.config.NextProtos); selectedProto != "" {
 			hs.hello.alpnProtocol = selectedProto
 			c.clientProtocol = selectedProto
 		}
 	}
 
-	hs.cert, err = c.config.getCertificate(clientHelloInfo(c, hs.clientHello))
+	hs.cert, err = c.config.getCertificate(clientHelloInfo(hs.ctx, c, hs.clientHello))
 	if err != nil {
 		if err == errNoCertificates {
 			c.sendAlert(alertUnrecognizedName)
@@ -303,9 +303,23 @@ func (hs *serverHandshakeState) pickCipherSuite() error {
 	if c.config.PreferServerCipherSuites {
 		preferenceList = c.config.cipherSuites()
 		supportedList = hs.clientHello.cipherSuites
+
+		// If the client does not seem to have hardware support for AES-GCM,
+		// and the application did not specify a cipher suite preference order,
+		// prefer other AEAD ciphers even if we prioritized AES-GCM ciphers
+		// by default.
+		if c.config.CipherSuites == nil && !aesgcmPreferred(hs.clientHello.cipherSuites) {
+			preferenceList = deprioritizeAES(preferenceList)
+		}
 	} else {
 		preferenceList = hs.clientHello.cipherSuites
 		supportedList = c.config.cipherSuites()
+
+		// If we don't have hardware support for AES-GCM, prefer other AEAD
+		// ciphers even if the client prioritized AES-GCM.
+		if !hasAESGCMHardwareSupport {
+			preferenceList = deprioritizeAES(preferenceList)
+		}
 	}
 
 	hs.suite = selectCipherSuite(preferenceList, supportedList, hs.cipherSuiteOk)
@@ -313,6 +327,7 @@ func (hs *serverHandshakeState) pickCipherSuite() error {
 		c.sendAlert(alertHandshakeFailure)
 		return errors.New("tls: no cipher suite supported by both client and server")
 	}
+	c.cipherSuite = hs.suite.id
 
 	for _, id := range hs.clientHello.cipherSuites {
 		if id == TLS_FALLBACK_SCSV {
@@ -412,6 +427,7 @@ func (hs *serverHandshakeState) doResumeHandshake() error {
 	c := hs.c
 
 	hs.hello.cipherSuite = hs.suite.id
+	c.cipherSuite = hs.suite.id
 	// We echo the client's session ID in the ServerHello to let it know
 	// that we're doing a resumption.
 	hs.hello.sessionId = hs.clientHello.sessionId
@@ -428,6 +444,13 @@ func (hs *serverHandshakeState) doResumeHandshake() error {
 		Certificate: hs.sessionState.certificates,
 	}); err != nil {
 		return err
+	}
+
+	if c.config.VerifyConnection != nil {
+		if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {
+			c.sendAlert(alertBadCertificate)
+			return err
+		}
 	}
 
 	hs.masterSecret = hs.sessionState.masterSecret
@@ -553,14 +576,11 @@ func (hs *serverHandshakeState) doFullHandshake() error {
 		if err != nil {
 			return err
 		}
-	} else {
-		// Make sure the connection is still being verified whether or not
-		// the server requested a client certificate.
-		if c.config.VerifyConnection != nil {
-			if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {
-				c.sendAlert(alertBadCertificate)
-				return err
-			}
+	}
+	if c.config.VerifyConnection != nil {
+		if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {
+			c.sendAlert(alertBadCertificate)
+			return err
 		}
 	}
 
@@ -640,13 +660,13 @@ func (hs *serverHandshakeState) establishKeys() error {
 		keysFromMasterSecret(c.vers, hs.suite, hs.masterSecret, hs.clientHello.random, hs.hello.random, hs.suite.macLen, hs.suite.keyLen, hs.suite.ivLen)
 
 	var clientCipher, serverCipher interface{}
-	var clientHash, serverHash macFunction
+	var clientHash, serverHash hash.Hash
 
 	if hs.suite.aead == nil {
 		clientCipher = hs.suite.cipher(clientKey, clientIV, true /* for reading */)
-		clientHash = hs.suite.mac(c.vers, clientMAC)
+		clientHash = hs.suite.mac(clientMAC)
 		serverCipher = hs.suite.cipher(serverKey, serverIV, false /* not for reading */)
-		serverHash = hs.suite.mac(c.vers, serverMAC)
+		serverHash = hs.suite.mac(serverMAC)
 	} else {
 		clientCipher = hs.suite.aead(clientKey, clientIV)
 		serverCipher = hs.suite.aead(serverKey, serverIV)
@@ -688,12 +708,22 @@ func (hs *serverHandshakeState) readFinished(out []byte) error {
 }
 
 func (hs *serverHandshakeState) sendSessionTicket() error {
+	// ticketSupported is set in a resumption handshake if the
+	// ticket from the client was encrypted with an old session
+	// ticket key and thus a refreshed ticket should be sent.
 	if !hs.hello.ticketSupported {
 		return nil
 	}
 
 	c := hs.c
 	m := new(newSessionTicketMsg)
+
+	createdAt := uint64(c.config.time().Unix())
+	if hs.sessionState != nil {
+		// If this is re-wrapping an old key, then keep
+		// the original time it was created.
+		createdAt = hs.sessionState.createdAt
+	}
 
 	var certsFromClient [][]byte
 	for _, cert := range c.peerCertificates {
@@ -702,7 +732,7 @@ func (hs *serverHandshakeState) sendSessionTicket() error {
 	state := sessionState{
 		vers:         c.vers,
 		cipherSuite:  hs.suite.id,
-		createdAt:    uint64(c.config.time().Unix()),
+		createdAt:    createdAt,
 		masterSecret: hs.masterSecret,
 		certificates: certsFromClient,
 	}
@@ -734,7 +764,6 @@ func (hs *serverHandshakeState) sendFinished(out []byte) error {
 		return err
 	}
 
-	c.cipherSuite = hs.suite.id
 	copy(out, finished.verifyData)
 
 	return nil
@@ -800,17 +829,10 @@ func (c *Conn) processCertsFromClient(certificate Certificate) error {
 		}
 	}
 
-	if c.config.VerifyConnection != nil {
-		if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {
-			c.sendAlert(alertBadCertificate)
-			return err
-		}
-	}
-
 	return nil
 }
 
-func clientHelloInfo(c *Conn, clientHello *clientHelloMsg) *ClientHelloInfo {
+func clientHelloInfo(ctx context.Context, c *Conn, clientHello *clientHelloMsg) *ClientHelloInfo {
 	supportedVersions := clientHello.supportedVersions
 	if len(clientHello.supportedVersions) == 0 {
 		supportedVersions = supportedVersionsFromMax(clientHello.vers)
@@ -826,5 +848,6 @@ func clientHelloInfo(c *Conn, clientHello *clientHelloMsg) *ClientHelloInfo {
 		SupportedVersions: supportedVersions,
 		Conn:              c.conn,
 		config:            c.config,
+		ctx:               ctx,
 	}
 }

@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http/httptrace"
 	"net/http/internal"
 	"net/textproto"
@@ -156,7 +155,7 @@ func newTransferWriter(r interface{}) (t *transferWriter, err error) {
 // servers. See Issue 18257, as one example.
 //
 // The only reason we'd send such a request is if the user set the Body to a
-// non-nil value (say, ioutil.NopCloser(bytes.NewReader(nil))) and didn't
+// non-nil value (say, io.NopCloser(bytes.NewReader(nil))) and didn't
 // set ContentLength, or NewRequest set it to -1 (unknown), so then we assume
 // there's bytes to send.
 //
@@ -258,7 +257,7 @@ func (t *transferWriter) shouldSendContentLength() bool {
 		return false
 	}
 	// Many servers expect a Content-Length for these methods
-	if t.Method == "POST" || t.Method == "PUT" {
+	if t.Method == "POST" || t.Method == "PUT" || t.Method == "PATCH" {
 		return true
 	}
 	if t.ContentLength == 0 && isIdentity(t.TransferEncoding) {
@@ -330,12 +329,21 @@ func (t *transferWriter) writeHeader(w io.Writer, trace *httptrace.ClientTrace) 
 	return nil
 }
 
-func (t *transferWriter) writeBody(w io.Writer) error {
-	var err error
+// always closes t.BodyCloser
+func (t *transferWriter) writeBody(w io.Writer) (err error) {
 	var ncopy int64
+	closed := false
+	defer func() {
+		if closed || t.BodyCloser == nil {
+			return
+		}
+		if closeErr := t.BodyCloser.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	// Write body. We "unwrap" the body first if it was wrapped in a
-	// nopCloser. This is to ensure that we can take advantage of
+	// nopCloser or readTrackingBody. This is to ensure that we can take advantage of
 	// OS-level optimizations in the event that the body is an
 	// *os.File.
 	if t.Body != nil {
@@ -361,7 +369,7 @@ func (t *transferWriter) writeBody(w io.Writer) error {
 				return err
 			}
 			var nextra int64
-			nextra, err = t.doBodyCopy(ioutil.Discard, body)
+			nextra, err = t.doBodyCopy(io.Discard, body)
 			ncopy += nextra
 		}
 		if err != nil {
@@ -369,6 +377,7 @@ func (t *transferWriter) writeBody(w io.Writer) error {
 		}
 	}
 	if t.BodyCloser != nil {
+		closed = true
 		if err := t.BodyCloser.Close(); err != nil {
 			return err
 		}
@@ -413,7 +422,10 @@ func (t *transferWriter) unwrapBody() io.Reader {
 	if reflect.TypeOf(t.Body) == nopCloserType {
 		return reflect.ValueOf(t.Body).Field(0).Interface().(io.Reader)
 	}
-
+	if r, ok := t.Body.(*readTrackingBody); ok {
+		r.didRead = true
+		return r.ReadCloser
+	}
 	return t.Body
 }
 
@@ -979,7 +991,7 @@ func (b *body) Close() error {
 			var n int64
 			// Consume the body, or, which will also lead to us reading
 			// the trailer headers after the body, if present.
-			n, err = io.CopyN(ioutil.Discard, bodyLocked{b}, maxPostHandlerReadBytes)
+			n, err = io.CopyN(io.Discard, bodyLocked{b}, maxPostHandlerReadBytes)
 			if err == io.EOF {
 				err = nil
 			}
@@ -990,7 +1002,7 @@ func (b *body) Close() error {
 	default:
 		// Fully consume the body, which will also lead to us reading
 		// the trailer headers after the body, if present.
-		_, err = io.Copy(ioutil.Discard, bodyLocked{b})
+		_, err = io.Copy(io.Discard, bodyLocked{b})
 	}
 	b.closed = true
 	return err
@@ -1036,11 +1048,11 @@ func parseContentLength(cl string) (int64, error) {
 	if cl == "" {
 		return -1, nil
 	}
-	n, err := strconv.ParseInt(cl, 10, 64)
-	if err != nil || n < 0 {
+	n, err := strconv.ParseUint(cl, 10, 63)
+	if err != nil {
 		return 0, badStringError("bad Content-Length", cl)
 	}
-	return n, nil
+	return int64(n), nil
 
 }
 
@@ -1062,7 +1074,7 @@ func (fr finishAsyncByteRead) Read(p []byte) (n int, err error) {
 	return
 }
 
-var nopCloserType = reflect.TypeOf(ioutil.NopCloser(nil))
+var nopCloserType = reflect.TypeOf(io.NopCloser(nil))
 
 // isKnownInMemoryReader reports whether r is a type known to not
 // block on Read. Its caller uses this as an optional optimization to
@@ -1074,6 +1086,9 @@ func isKnownInMemoryReader(r io.Reader) bool {
 	}
 	if reflect.TypeOf(r) == nopCloserType {
 		return isKnownInMemoryReader(reflect.ValueOf(r).Field(0).Interface().(io.Reader))
+	}
+	if r, ok := r.(*readTrackingBody); ok {
+		return isKnownInMemoryReader(r.ReadCloser)
 	}
 	return false
 }

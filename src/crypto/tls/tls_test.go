@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"internal/testenv"
 	"io"
-	"io/ioutil"
 	"math"
 	"net"
 	"os"
@@ -569,8 +568,8 @@ func TestConnCloseBreakingWrite(t *testing.T) {
 	}
 
 	<-closeReturned
-	if err := tconn.Close(); err != errClosed {
-		t.Errorf("Close error = %v; want errClosed", err)
+	if err := tconn.Close(); err != net.ErrClosed {
+		t.Errorf("Close error = %v; want net.ErrClosed", err)
 	}
 }
 
@@ -594,7 +593,7 @@ func TestConnCloseWrite(t *testing.T) {
 		}
 		defer srv.Close()
 
-		data, err := ioutil.ReadAll(srv)
+		data, err := io.ReadAll(srv)
 		if err != nil {
 			return err
 		}
@@ -635,7 +634,7 @@ func TestConnCloseWrite(t *testing.T) {
 			return fmt.Errorf("CloseWrite error = %v; want errShutdown", err)
 		}
 
-		data, err := ioutil.ReadAll(conn)
+		data, err := io.ReadAll(conn)
 		if err != nil {
 			return err
 		}
@@ -698,7 +697,7 @@ func TestWarningAlertFlood(t *testing.T) {
 		}
 		defer srv.Close()
 
-		_, err = ioutil.ReadAll(srv)
+		_, err = io.ReadAll(srv)
 		if err == nil {
 			return errors.New("unexpected lack of error from server")
 		}
@@ -785,11 +784,6 @@ func TestCloneNonFuncFields(t *testing.T) {
 	typ := v.Type()
 	for i := 0; i < typ.NumField(); i++ {
 		f := v.Field(i)
-		if !f.CanSet() {
-			// unexported field; not cloned.
-			continue
-		}
-
 		// testing/quick can't handle functions or interfaces and so
 		// isn't used here.
 		switch fn := typ.Field(i).Name; fn {
@@ -830,19 +824,26 @@ func TestCloneNonFuncFields(t *testing.T) {
 			f.Set(reflect.ValueOf([]CurveID{CurveP256}))
 		case "Renegotiation":
 			f.Set(reflect.ValueOf(RenegotiateOnceAsClient))
+		case "mutex", "autoSessionTicketKeys", "sessionTicketKeys":
+			continue // these are unexported fields that are handled separately
 		default:
 			t.Errorf("all fields must be accounted for, but saw unknown field %q", fn)
 		}
 	}
+	// Set the unexported fields related to session ticket keys, which are copied with Clone().
+	c1.autoSessionTicketKeys = []ticketKey{c1.ticketKeyFromBytes(c1.SessionTicketKey)}
+	c1.sessionTicketKeys = []ticketKey{c1.ticketKeyFromBytes(c1.SessionTicketKey)}
 
 	c2 := c1.Clone()
-	// DeepEqual also compares unexported fields, thus c2 needs to have run
-	// serverInit in order to be DeepEqual to c1. Cloning it and discarding
-	// the result is sufficient.
-	c2.Clone()
-
 	if !reflect.DeepEqual(&c1, c2) {
 		t.Errorf("clone failed to copy a field")
+	}
+}
+
+func TestCloneNilConfig(t *testing.T) {
+	var config *Config
+	if cc := config.Clone(); cc != nil {
+		t.Fatalf("Clone with nil should return nil, got: %+v", cc)
 	}
 }
 
@@ -1448,7 +1449,7 @@ func (s brokenSigner) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts
 }
 
 // TestPKCS1OnlyCert uses a client certificate with a broken crypto.Signer that
-// always makes PKCS#1 v1.5 signatures, so can't be used with RSA-PSS.
+// always makes PKCS #1 v1.5 signatures, so can't be used with RSA-PSS.
 func TestPKCS1OnlyCert(t *testing.T) {
 	clientConfig := testConfig.Clone()
 	clientConfig.Certificates = []Certificate{{
@@ -1456,7 +1457,7 @@ func TestPKCS1OnlyCert(t *testing.T) {
 		PrivateKey:  brokenSigner{testRSAPrivateKey},
 	}}
 	serverConfig := testConfig.Clone()
-	serverConfig.MaxVersion = VersionTLS12 // TLS 1.3 doesn't support PKCS#1 v1.5
+	serverConfig.MaxVersion = VersionTLS12 // TLS 1.3 doesn't support PKCS #1 v1.5
 	serverConfig.ClientAuth = RequireAnyClientCert
 
 	// If RSA-PSS is selected, the handshake should fail.
