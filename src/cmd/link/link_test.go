@@ -320,6 +320,7 @@ func TestBuildForTvOS(t *testing.T) {
 	}
 
 	link := exec.Command(CC[0], CC[1:]...)
+	link.Args = append(link.Args, "-o", filepath.Join(tmpDir, "a.out")) // Avoid writing to package directory.
 	link.Args = append(link.Args, ar, filepath.Join("testdata", "testBuildFortvOS", "main.m"))
 	if out, err := link.CombinedOutput(); err != nil {
 		t.Fatalf("%v: %v:\n%s", link.Args, err, out)
@@ -784,6 +785,25 @@ func TestPErsrc(t *testing.T) {
 		t.Fatalf("reading output failed: %v", err)
 	}
 	if !bytes.Contains(b, []byte("Hello Gophers!")) {
+		t.Fatalf("binary does not contain expected content")
+	}
+
+	pkgdir = filepath.Join("testdata", "testPErsrc-complex")
+	exe = filepath.Join(tmpdir, "a.exe")
+	cmd = exec.Command(testenv.GoToolPath(t), "build", "-o", exe)
+	cmd.Dir = pkgdir
+	// cmd.Env = append(os.Environ(), "GOOS=windows", "GOARCH=amd64") // uncomment if debugging in a cross-compiling environment
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("building failed: %v, output:\n%s", err, out)
+	}
+
+	// Check that the binary contains the rsrc data
+	b, err = ioutil.ReadFile(exe)
+	if err != nil {
+		t.Fatalf("reading output failed: %v", err)
+	}
+	if !bytes.Contains(b, []byte("resname RCDATA a.rc")) {
 		t.Fatalf("binary does not contain expected content")
 	}
 }
