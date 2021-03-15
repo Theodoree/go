@@ -5,6 +5,7 @@
 package runtime
 
 import (
+	"internal/abi"
 	"runtime/internal/atomic"
 	"runtime/internal/sys"
 	"unsafe"
@@ -698,7 +699,7 @@ func printpanics(p *_panic) {
 // specified by sp. If sp is nil, it uses the sp from the current defer record
 // (which has just been finished). Hence, it continues the stack scan from the
 // frame of the defer that just finished. It skips any frame that already has an
-// open-coded _defer record, which would have been been created from a previous
+// open-coded _defer record, which would have been created from a previous
 // (unrecovered) panic.
 //
 // Note: All entries of the defer chain (including this new open-coded entry) have
@@ -874,7 +875,13 @@ func reflectcallSave(p *_panic, fn, arg unsafe.Pointer, argsize uint32) {
 		p.pc = getcallerpc()
 		p.sp = unsafe.Pointer(getcallersp())
 	}
-	reflectcall(nil, fn, arg, argsize, argsize)
+	// Pass a dummy RegArgs for now since no function actually implements
+	// the register-based ABI.
+	//
+	// TODO(mknyszek): Implement this properly, setting up arguments in
+	// registers as necessary in the caller.
+	var regs abi.RegArgs
+	reflectcall(nil, fn, arg, argsize, argsize, argsize, &regs)
 	if p != nil {
 		p.pc = 0
 		p.sp = unsafe.Pointer(nil)
@@ -968,7 +975,9 @@ func gopanic(e interface{}) {
 			}
 		} else {
 			p.argp = unsafe.Pointer(getargp(0))
-			reflectcall(nil, unsafe.Pointer(d.fn), deferArgs(d), uint32(d.siz), uint32(d.siz))
+
+			var regs abi.RegArgs
+			reflectcall(nil, unsafe.Pointer(d.fn), deferArgs(d), uint32(d.siz), uint32(d.siz), uint32(d.siz), &regs)
 		}
 		p.argp = nil
 

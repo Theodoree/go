@@ -36,6 +36,8 @@ import (
 	"cmd/go/internal/str"
 	"cmd/go/internal/trace"
 	"cmd/internal/sys"
+
+	"golang.org/x/mod/module"
 )
 
 var IgnoreImports bool // control whether we ignore imports in packages
@@ -1321,6 +1323,11 @@ func reusePackage(p *Package, stk *ImportStack) *Package {
 				Err:           errors.New("import cycle not allowed"),
 				IsImportCycle: true,
 			}
+		} else if !p.Error.IsImportCycle {
+			// If the error is already set, but it does not indicate that
+			// we are in an import cycle, set IsImportCycle so that we don't
+			// end up stuck in a loop down the road.
+			p.Error.IsImportCycle = true
 		}
 		p.Incomplete = true
 	}
@@ -2090,6 +2097,9 @@ func validEmbedPattern(pattern string) bool {
 // can't or won't be included in modules and therefore shouldn't be treated
 // as existing for embedding.
 func isBadEmbedName(name string) bool {
+	if err := module.CheckFilePath(name); err != nil {
+		return true
+	}
 	switch name {
 	// Empty string should be impossible but make it bad.
 	case "":
